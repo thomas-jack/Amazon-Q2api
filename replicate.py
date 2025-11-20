@@ -2,6 +2,7 @@ import json
 import uuid
 import os
 import asyncio
+import weakref
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Iterator, List, AsyncGenerator, Any
 import struct
@@ -329,14 +330,30 @@ async def send_chat_request(
                 if isinstance(text, str) and text:
                     yield text
         
+        def _schedule_cleanup():
+            """Schedule async cleanup when generator is garbage collected without being consumed."""
+            if resp and not resp.is_closed:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.create_task(resp.aclose())
+                        if local_client and client:
+                            asyncio.create_task(client.aclose())
+                except Exception:
+                    pass
+        
         if stream:
             # If raw_payload is used, we might want the raw event stream
             if raw_payload:
-                # Return event stream directly - cleanup handled by _iter_events
-                return None, None, tracker, _iter_events()
+                # Return event stream with finalizer as safety net
+                event_gen = _iter_events()
+                weakref.finalize(event_gen, _schedule_cleanup)
+                return None, None, tracker, event_gen
             
-            # Return text stream directly - cleanup handled by _iter_events
-            return None, tracker.track(_iter_text()), tracker, None
+            # Return text stream with finalizer as safety net
+            text_gen = tracker.track(_iter_text())
+            weakref.finalize(text_gen, _schedule_cleanup)
+            return None, text_gen, tracker, None
         else:
             buf = []
             try:
